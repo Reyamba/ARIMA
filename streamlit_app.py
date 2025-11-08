@@ -109,6 +109,8 @@ Nueva Era,2025,Q4,2025-10-01,2.29,20.5,24.5
     df['Period'] = pd.to_datetime(df['Period'])
     
     # Handle any potential missing values by filling with the mean of the column
+    # NOTE: Filling with mean is a simple approach. More complex imputation methods 
+    # might be needed for production.
     df.fillna(df.mean(numeric_only=True), inplace=True) 
     
     return df
@@ -128,20 +130,20 @@ def arima_forecast(data_series, forecast_end_year):
         
     Returns:
         pd.DataFrame: DataFrame containing historical and forecasted data.
+        str: Model summary or error message.
     """
     if data_series.empty or len(data_series) < 5:
         return None, "Error: Insufficient data to perform forecasting."
         
     # Standard practice: Use ARIMA(1, 1, 0) as a robust, simple model for demonstration
-    # In a real-world scenario, the (p, d, q) parameters would be determined
-    # using auto_arima or ACF/PACF plots.
     try:
-        # Check for non-stationarity and apply differencing if needed
-        # We assume d=1 (one difference) for most non-stationary time series
+        # ARIMA model constructor will try to infer frequency from the index. 
+        # We explicitly set freq='QS-JAN' to ensure quarterly start dates are used.
         model = ARIMA(data_series, order=(1, 1, 0), freq='QS-JAN')
         model_fit = model.fit()
         
         # Determine the start date for forecasting (the period after the last known data point)
+        # Using DateOffset(months=3) correctly moves to the next quarter start
         start_date = data_series.index[-1] + DateOffset(months=3)
         
         # Create the future date range (Quarterly Start frequency)
@@ -213,7 +215,9 @@ edited_df = st.data_editor(
 
 # Convert the edited DataFrame back to a time series for modeling
 edited_df['Period'] = pd.to_datetime(edited_df['Period'])
-ts_data = edited_df.set_index('Period')['Copra_Production (MT)'].sort_index(freq='QS-JAN')
+# FIX: Removed freq='QS-JAN' from sort_index() to avoid TypeError 
+# when the index frequency is lost by st.data_editor interaction.
+ts_data = edited_df.set_index('Period')['Copra_Production (MT)'].sort_index()
 last_historical_date = ts_data.index.max()
 
 # --- B. Trend Analysis & Visualization ---
@@ -242,7 +246,9 @@ with col2:
     # Show only year labels on X-axis for readability
     n_ticks = len(ts_data)
     if n_ticks > 0:
+        # Determine skip count dynamically
         skip_count = max(1, n_ticks // 8) # Show max 8 ticks
+        # Map the date index to year strings, skipping labels for cleaner look
         tick_labels = [label.strftime('%Y') if i % skip_count == 0 else '' for i, label in enumerate(ts_data.index)]
         ax_bar.set_xticklabels(tick_labels, rotation=45, ha='right')
         
