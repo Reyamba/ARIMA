@@ -6,7 +6,6 @@ from statsmodels.tsa.arima.model import ARIMA
 from pandas.tseries.offsets import DateOffset
 import warnings
 from sklearn.metrics import mean_absolute_percentage_error as calculate_mape
-import numpy as np
 
 # Suppress warnings from statsmodels, which are common in Streamlit environments
 warnings.filterwarnings("ignore")
@@ -404,77 +403,73 @@ Nueva Era,2025,Q3,2025-07-01,12.50,56.79,72.70
 """
 
 @st.cache_data
-def load_initial_data():
-    """Loads and preprocesses the Copra Production data from the string."""
+def load_data():
+    """Loads and preprocesses the Copra Production data."""
     df = pd.read_csv(io.StringIO(CSV_CONTENT))
 
-    # Convert 'Period' to datetime objects and set as index temporarily for sorting
+    # Convert 'Period' to datetime objects and set as index
     df['Period'] = pd.to_datetime(df['Period'])
+    df['Year'] = df['Period'].dt.year
+    df['Quarter'] = 'Q' + df['Period'].dt.quarter.astype(str)
     
-    # Ensure Period is correctly formatted as Year-Month-Day for Q1, Q2, Q3, Q4 starting dates
-    def determine_period(row):
-        year = row['Year']
-        quarter = row['Quarter']
-        if quarter == 'Q1': return f"{year}-01-01"
-        if quarter == 'Q2': return f"{year}-04-01"
-        if quarter == 'Q3': return f"{year}-07-01"
-        if quarter == 'Q4': return f"{year}-10-01"
-        return f"{year}-01-01" # Default fallback
-
-    # Re-calculate 'Period' just in case the string dates were inconsistent, using Year and Quarter
-    df['Period'] = df.apply(determine_period, axis=1)
-    df['Period'] = pd.to_datetime(df['Period'])
-
     # Handle any potential missing values by filling with the mean of the column
-    df.fillna(df.mean(numeric_only=True), inplace=True)
+    # We do this before using the data in case of dynamic row additions.
+    df.fillna(df.mean(numeric_only=True), inplace=True) 
     
-    return df.sort_values(by=['Barangay', 'Period']).reset_index(drop=True)
+    return df
 
-# --- Helper function for single series ARIMA Forecasting ---
-def single_series_forecast(data_series, forecast_end_year, order=(1, 1, 0), n_test=4):
+def initialize_session_data():
+    """Initializes the data into Streamlit session state if not already present."""
+    if 'df_data' not in st.session_state:
+        st.session_state['df_data'] = load_data()
+
+
+# --- 2. ARIMA Forecasting Function (Updated for MAPE) ---
+
+# Note: st.cache_data relies on function arguments. We avoid passing the entire DataFrame
+# to let the caching work effectively with the selected series.
+@st.cache_data
+def arima_forecast(data_series, forecast_end_year):
     """
-    Fits an ARIMA model for a single series, calculates MAPE, and forecasts.
+    Fits an ARIMA model, calculates MAPE on the last 4 historical points,
+    and forecasts the series up to the specified year.
     
-    Returns: (pd.Series: Forecasted values, str: MAPE, str: Model Summary)
+    Args:
+        data_series (pd.Series): The time series data (Copra Production).
+        forecast_end_year (int): The last year to forecast to (e.g., 2035).
+        
+    Returns:
+        tuple: (pd.DataFrame, str, str) -> (Combined Data, Model Summary, MAPE String)
     """
-    column_name = data_series.name
-    mape_str = "N/A"
-    model_summary = "N/A"
-    
     if data_series.empty or len(data_series) < 5:
-        return pd.Series(dtype=float), f"N/A (Insufficient data for {column_name})", "Error: Insufficient data"
-
+        return None, "Error: Insufficient data to perform forecasting (need at least 5 quarters).", "N/A"
+        
+    # 1. Backtest Split for MAPE Calculation (using last 4 quarters for testing)
+    n_test = 4
+    mape_str = "N/A (Not enough data points for validation)"
+    
     try:
-        # 1. Backtest Split for MAPE Calculation (using last 4 quarters for testing)
+        # Check if there is enough data to split for a meaningful MAPE calculation
         if len(data_series) > n_test:
             train_data = data_series[:-n_test]
             test_data = data_series[-n_test:]
 
             # Temporarily fit model on training data for evaluation
-            model_train = ARIMA(train_data, order=order, freq='QS-JAN')
+            # Using freq='QS-JAN' assumes quarterly data starting in Jan (Q1, Q2, Q3, Q4)
+            model_train = ARIMA(train_data, order=(1, 1, 0), freq='QS-JAN')
             model_fit_train = model_train.fit()
             
             # Predict the test period
             test_forecast = model_fit_train.get_forecast(steps=n_test)
             test_pred = test_forecast.predicted_mean
             
-            # Calculate MAPE, ensuring no division by zero for the test_data
-            actual_values = test_data.values
-            predicted_values = test_pred.values
+            # Calculate MAPE
+            mape_value = calculate_mape(test_data.values, test_pred.values) * 100
+            mape_str = f"{mape_value:.2f}% "
             
-            # Use only non-zero actuals for MAPE calculation to avoid division by zero
-            non_zero_mask = actual_values != 0
-            if non_zero_mask.sum() > 0:
-                 # Calculate MAPE: mean(|actual - predicted| / |actual|) * 100
-                mape_value = np.mean(np.abs((actual_values[non_zero_mask] - predicted_values[non_zero_mask]) / actual_values[non_zero_mask])) * 100
-                mape_str = f"{mape_value:.2f}%"
-            else:
-                 mape_str = "0.00% (Actual values are all zero)"
-
         # 2. Main Forecast: Fit model on ALL available historical data
-        model_full = ARIMA(data_series, order=order, freq='QS-JAN')
+        model_full = ARIMA(data_series, order=(1, 1, 0), freq='QS-JAN')
         model_fit_full = model_full.fit()
-        model_summary = model_fit_full.summary().as_html()
         
         # Determine the start date for forecasting
         start_date = data_series.index[-1] + DateOffset(months=3)
@@ -485,97 +480,45 @@ def single_series_forecast(data_series, forecast_end_year, order=(1, 1, 0), n_te
         # Generate the forecast
         forecast = model_fit_full.get_forecast(steps=len(future_dates))
         forecast_values = forecast.predicted_mean
-        forecast_values.index = future_dates
         
-        # Ensure all predicted values are non-negative (Production/Price cannot be negative)
-        forecast_values[forecast_values < 0] = 0.0
+        # Create a DataFrame for the forecast results
+        df_forecast = pd.DataFrame({
+            'Period': future_dates, 
+            'Copra_Production (MT)': forecast_values.values,
+            'Type': 'Forecast'
+        }).set_index('Period')
         
-        return forecast_values, mape_str, model_summary
+        # Prepare historical data for plotting
+        df_historical = pd.DataFrame({
+            'Period': data_series.index,
+            'Copra_Production (MT)': data_series.values,
+            'Type': 'Historical'
+        }).set_index('Period')
+        
+        # Combine historical and forecasted data
+        df_combined = pd.concat([df_historical, df_forecast])
+        
+        return df_combined, model_fit_full.summary(), mape_str
         
     except Exception as e:
-        error_msg = f"ARIMA Model Error for {column_name}: {e}"
-        # st.error(error_msg) # Suppress error display in the main run for cleaner output
-        return pd.Series(dtype=float), "N/A (Model Failed)", error_msg
-
-
-# --- 2. ARIMA Forecasting Function (Updated for Multi-Series) ---
-def arima_multi_forecast(df_barangay, forecast_end_year):
-    """
-    Performs ARIMA forecasting for Copra Production, Farmgate Price, and Millgate Price.
-    """
-    
-    if df_barangay.empty or len(df_barangay) < 5:
-        return None, "Error: Insufficient data to perform forecasting.", "N/A", "N/A"
-        
-    # Set Period as index for time series analysis
-    df_ts = df_barangay.set_index('Period').sort_index()
-
-    ts_prod = df_ts['Copra_Production (MT)']
-    ts_farm = df_ts['Farmgate Price (PHP/kg)']
-    ts_mill = df_ts['Millgate Price (PHP/kg)']
-    
-    # 1. Determine Future Dates for all forecasts
-    last_historical_date = ts_prod.index.max()
-    start_date = last_historical_date + DateOffset(months=3)
-    future_dates = pd.date_range(start=start_date, end=f'{forecast_end_year}-10-01', freq='QS')
-    
-    # 2. Run single-series forecasts (ARIMA(1, 1, 0) for all)
-    
-    # Production Forecast (main series for overall MAPE)
-    prod_forecast_values, prod_mape_str, prod_model_summary = single_series_forecast(
-        ts_prod, forecast_end_year
-    )
-
-    # Farmgate Price Forecast
-    farm_forecast_values, farm_mape_str, farm_model_summary = single_series_forecast(
-        ts_farm, forecast_end_year
-    )
-
-    # Millgate Price Forecast
-    mill_forecast_values, mill_mape_str, mill_model_summary = single_series_forecast(
-        ts_mill, forecast_end_year
-    )
-    
-    # 3. Combine Forecasts into a single DataFrame
-    df_forecast = pd.DataFrame(index=future_dates)
-    
-    if not prod_forecast_values.empty:
-        df_forecast['Copra_Production (MT)'] = prod_forecast_values
-        df_forecast['Type'] = 'Forecast'
-
-    if not farm_forecast_values.empty:
-        df_forecast['Farmgate Price (PHP/kg)'] = farm_forecast_values.round(2)
-
-    if not mill_forecast_values.empty:
-        df_forecast['Millgate Price (PHP/kg)'] = mill_forecast_values.round(2)
-
-    # 4. Prepare Historical Data
-    df_historical = df_ts.copy()
-    df_historical['Type'] = 'Historical'
-    
-    # 5. Combine historical and forecasted data
-    df_combined = pd.concat([df_historical, df_forecast])
-    
-    return (
-        df_combined, 
-        prod_model_summary, 
-        prod_mape_str,
-        (farm_mape_str, mill_mape_str) # Tuple of price MAPEs
-    )
+        return None, f"ARIMA Model Error: {e}", "N/A"
 
 
 # --- 3. Page Functions ---
 
-def main_page(df_original):
+def main_page():
     """Displays the single-barangay data editor, visualization, and ARIMA forecast."""
     
     st.title(":coconut: Barangay Production Analysis & Forecasting")
     st.markdown("---")
-
-    # Get unique barangays for selection
-    barangays = df_original['Barangay'].unique()
     
-    # Sidebar Selection (uses session state key for persistence)
+    # Use data from session state
+    df_current = st.session_state['df_data']
+    
+    # Get unique barangays for selection
+    barangays = df_current['Barangay'].unique()
+    
+    # Sidebar for Filtering
     st.sidebar.header("Barangay Selection")
     selected_barangay = st.sidebar.selectbox(
         "Select Barangay for Analysis:",
@@ -585,122 +528,95 @@ def main_page(df_original):
     
     # --- A. Data Viewer and Editor ---
     st.header(f"1. Raw Data Viewer & Editor for {selected_barangay}")
-    st.info("You can directly edit values or delete rows. Changes here will be saved for the current session and used in the forecast.")
+    st.info("You can directly edit the values below or use the 'Add New Data Point' section to append a row.")
 
-    # Filter data for the selected barangay
-    df_barangay = df_original[df_original['Barangay'] == selected_barangay].copy()
-    df_barangay_editable = df_barangay.sort_values(by='Period', ascending=True).reset_index(drop=True)
+    # Filter data for the selected barangay to display in the editor
+    df_barangay_editable = df_current[df_current['Barangay'] == selected_barangay].sort_values(by='Period', ascending=True).copy()
 
-    # Use st.data_editor for interactive editing and get the updated DataFrame
-    edited_df_barangay = st.data_editor(
+    # Use st.data_editor for interactive editing/deleting of the filtered data
+    edited_df = st.data_editor(
         df_barangay_editable,
         column_config={
-            "Period": st.column_config.DatetimeColumn("Period (YYYY-MM-DD)", format="YYYY-MM-DD", disabled=True),
+            "Period": st.column_config.DatetimeColumn("Period", format="YYYY-MM-DD", disabled=True),
             "Barangay": st.column_config.TextColumn("Barangay", disabled=True),
-            # Make Year/Quarter/Period columns read-only as they define the time step
-            "Year": st.column_config.NumberColumn("Year", disabled=True),
-            "Quarter": st.column_config.TextColumn("Quarter", disabled=True),
         },
         key='data_editor',
         hide_index=True,
         num_rows="dynamic"
     )
-    
-    # Convert the edited DataFrame back to a time series for modeling and visualization
-    edited_df_barangay['Period'] = pd.to_datetime(edited_df_barangay['Period'])
-    edited_df_barangay = edited_df_barangay.sort_values(by='Period')
-    
-    # Update the master dataframe in session state after editing
-    # 1. Remove old rows for the selected barangay
-    st.session_state.df_master = st.session_state.df_master[st.session_state.df_master['Barangay'] != selected_barangay]
-    # 2. Append the edited rows
-    st.session_state.df_master = pd.concat([st.session_state.df_master, edited_df_barangay], ignore_index=True)
-    
-    # Re-extract the clean, updated time series data for the selected barangay
-    df_final = edited_df_barangay.copy()
 
-    ts_production = df_final.set_index('Period')['Copra_Production (MT)']
-    ts_farmgate = df_final.set_index('Period')['Farmgate Price (PHP/kg)']
-    ts_millgate = df_final.set_index('Period')['Millgate Price (PHP/kg)']
+    # Convert edited_df back to the main DataFrame
+    # Note: st.data_editor returns the current state of the displayed dataframe.
+    # We need to rebuild the main session state data using the edited section.
+    if edited_df.shape[0] != df_barangay_editable.shape[0] or not edited_df.equals(df_barangay_editable):
+        # 1. Remove old data for the selected barangay from the session state
+        df_other_barangays = df_current[df_current['Barangay'] != selected_barangay]
+        
+        # 2. Add the newly edited (or deleted/modified) data
+        st.session_state['df_data'] = pd.concat([df_other_barangays, edited_df], ignore_index=True)
+        # Rerun is usually needed only if the data structure changes, but we rerun later after adding data.
+        
+    # Filter the final, processed data for the current barangay
+    df_barangay_final = st.session_state['df_data'][st.session_state['df_data']['Barangay'] == selected_barangay].copy()
     
-    if ts_production.empty:
-        st.warning("No data points remaining for the selected barangay.")
-        return
-
+    # Convert the final DataFrame back to a time series for modeling and visualization
+    df_barangay_final['Period'] = pd.to_datetime(df_barangay_final['Period'])
+    df_barangay_final = df_barangay_final.set_index('Period').sort_index()
+    
+    ts_production = df_barangay_final['Copra_Production (MT)']
+    ts_farmgate = df_barangay_final['Farmgate Price (PHP/kg)']
+    ts_millgate = df_barangay_final['Millgate Price (PHP/kg)']
     last_historical_date = ts_production.index.max()
 
     # --- B. Add New Data Point Form ---
-    st.header(f"2. Add New Data Point for {selected_barangay}")
-    st.caption("Use this form to add a new quarterly historical data point.")
-    
-    with st.form("add_data_form", clear_on_submit=True):
-        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
-        
-        # Determine the next available year and quarter
-        next_year = last_historical_date.year
-        next_quarter_idx = last_historical_date.quarter + 1
-        
-        if next_quarter_idx > 4:
-            next_quarter_idx = 1
-            next_year += 1
+    st.header(f"1.5. Add New Data Point")
+    with st.expander("Click here to add a new data row"):
+        with st.form("add_data_form", clear_on_submit=True):
             
-        quarter_map = {1: 'Q1', 2: 'Q2', 3: 'Q3', 4: 'Q4'}
-        next_quarter = quarter_map[next_quarter_idx]
-        
-        # Map quarter index to month day
-        month_map = {1: 1, 2: 4, 3: 7, 4: 10}
-        
-        with col_f1:
-            new_year = st.number_input("Year", min_value=next_year, value=next_year, step=1, key='input_year')
-        with col_f2:
-            new_quarter = st.selectbox("Quarter", options=['Q1', 'Q2', 'Q3', 'Q4'], index=next_quarter_idx - 1, key='input_quarter')
+            # Use columns for a neat layout
+            col_b, col_p, col_c, col_f, col_m = st.columns(5)
             
-        with col_f3:
-            new_prod = st.number_input("Production (MT)", min_value=0.0, value=30.0, step=0.1, key='input_prod')
-        
-        col_f5, col_f6 = st.columns(2)
-        with col_f5:
-            new_farmgate = st.number_input("Farmgate Price (PHP/kg)", min_value=0.0, value=30.0, step=0.1, key='input_farmgate')
-        with col_f6:
-            new_millgate = st.number_input("Millgate Price (PHP/kg)", min_value=0.0, value=40.0, step=0.1, key='input_millgate')
+            # Default the barangay to the currently selected one
+            current_barangay_index = list(barangays).index(selected_barangay)
+            
+            new_barangay = col_b.selectbox("Barangay", options=barangays, index=current_barangay_index)
+            # Suggest the next period's date
+            suggested_date = last_historical_date + DateOffset(months=3) if not ts_production.empty else None
+            new_period = col_p.date_input("Period (Q1=Jan, Q2=Apr, Q3=Jul, Q4=Oct)", value=suggested_date)
 
-        submitted = st.form_submit_button("Add Data Point and Re-Analyze")
-        
-        if submitted:
-            try:
-                quarter_to_idx = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
-                month_start = month_map[quarter_to_idx[new_quarter]]
-                new_period_str = f"{new_year}-{month_start:02d}-01"
-                new_period = pd.to_datetime(new_period_str)
-                
-                # Check for duplicate entry (Period and Barangay)
-                is_duplicate = ((df_final['Period'] == new_period) & (df_final['Barangay'] == selected_barangay)).any()
-                
-                if is_duplicate:
-                    st.error(f"Data point for {new_quarter} {new_year} already exists. Please choose a unique period or edit the existing row in the table above.")
+            new_copra = col_c.number_input("Copra Production (MT)", min_value=0.0, format="%.2f")
+            new_farmgate = col_f.number_input("Farmgate Price (PHP/kg)", min_value=0.0, format="%.2f")
+            new_millgate = col_m.number_input("Millgate Price (PHP/kg)", min_value=0.0, format="%.2f")
+
+            submitted = st.form_submit_button("Add Data Point and Rerun Analysis")
+
+            if submitted:
+                if new_period is None:
+                    st.error("Please select a Period.")
                 else:
-                    new_row = pd.DataFrame([{
-                        'Barangay': selected_barangay,
-                        'Year': new_year,
-                        'Quarter': new_quarter,
-                        'Period': new_period,
-                        'Copra_Production (MT)': new_prod,
+                    new_period_dt = pd.to_datetime(new_period)
+                    new_data = {
+                        'Barangay': new_barangay,
+                        'Year': new_period_dt.year,
+                        'Quarter': f'Q{(new_period_dt.month - 1) // 3 + 1}',
+                        'Period': new_period_dt,
+                        'Copra_Production (MT)': new_copra,
                         'Farmgate Price (PHP/kg)': new_farmgate,
                         'Millgate Price (PHP/kg)': new_millgate
-                    }])
-                    # Append the new row to the session state master DF and force rerun
-                    st.session_state.df_master = pd.concat([st.session_state.df_master, new_row], ignore_index=True)
-                    st.toast(f"Successfully added data point for {new_quarter} {new_year}!", icon='✅')
-                    st.rerun() # Rerun to update the Data Editor and Charts
+                    }
+                    
+                    # Create a temporary DataFrame for the new row
+                    new_row_df = pd.DataFrame([new_data])
 
-            except Exception as e:
-                st.error(f"Error processing new data: {e}")
-
-    st.markdown("---")
+                    # Append to session state
+                    st.session_state['df_data'] = pd.concat([st.session_state['df_data'], new_row_df], ignore_index=True)
+                    st.success(f"New data point added for **{new_barangay}** on **{new_period_dt.strftime('%Y-%m-%d')}**. Rerunning app...")
+                    st.rerun() # Rerun to update plots and forecasts
 
     # --- C. Trend Analysis & Visualization (Production + Prices) ---
-    st.header("3. Historical Trends (Production & Prices)")
-    
+    st.header("2. Historical Trends (Production & Prices)")
+    st.subheader(f"Historical Data for {selected_barangay}")
+
     col1, col2 = st.columns(2)
 
     with col1:
@@ -730,18 +646,19 @@ def main_page(df_original):
         st.pyplot(fig_price)
 
     # --- D. Forecasting ---
-    st.header("4. ARIMA Forecasting (2026 - 2035)")
-    st.caption(f"Forecasting Copra Production and Prices starting from Q1 of the next period after {last_historical_date.strftime('%Y-%m-%d')}.")
+    st.header("3. ARIMA Forecasting (2026 - 2035)")
+    st.caption(f"Forecasting Copra Production (MT) starting from Q1 of the next period after {last_historical_date.strftime('%Y-%m-%d')}.")
 
     # Perform the forecast
-    df_combined_forecast, model_summary, prod_mape_str, (farm_mape_str, mill_mape_str) = arima_multi_forecast(df_final, 2035)
+    # We use ts_production.copy() to ensure the series is hashable for st.cache_data
+    df_combined_forecast, model_summary, mape_str = arima_forecast(ts_production.copy(), 2035)
 
-    if df_combined_forecast is not None and not df_combined_forecast.empty:
+    if df_combined_forecast is not None:
         
         # --- D1. Forecast Visualization ---
-        st.subheader("Forecast Visualization (Historical + Predicted Production)")
+        st.subheader("Forecast Visualization (Historical + Predicted)")
         
-        # Line plot with production forecast
+        # Line plot with forecast
         fig_forecast, ax_forecast = plt.subplots(figsize=(12, 6))
         
         # Plot Historical data
@@ -749,9 +666,9 @@ def main_page(df_original):
             ax=ax_forecast, label='Historical Production', color='#1E88E5', linestyle='-'
         )
         
-        # Plot Production Forecast data
+        # Plot Forecast data
         df_combined_forecast[df_combined_forecast['Type'] == 'Forecast']['Copra_Production (MT)'].plot(
-            ax=ax_forecast, label='ARIMA Production Forecast', color='#FF7043', linestyle='--'
+            ax=ax_forecast, label='ARIMA Forecast (2035)', color='#FF7043', linestyle='--'
         )
         
         ax_forecast.set_title(f'Copra Production Forecast for {selected_barangay} (2015-2035)')
@@ -769,64 +686,48 @@ def main_page(df_original):
         # --- D2. Forecast Metrics & Table ---
         st.subheader("Forecast Metrics & Data")
         
-        col_m1, col_m2, col_m3 = st.columns(3)
+        st.metric(
+            label="ARIMA Model Mean Absolute Percentage Error (MAPE)", 
+            value=mape_str,
+            help="MAPE is calculated by backtesting the model on the last 4 known historical quarters to estimate predictive accuracy."
+        )
 
-        with col_m1:
-            st.metric(
-                label="Production MAPE", 
-                value=prod_mape_str,
-                help="MAPE is calculated by backtesting the production model on the last 4 known historical quarters."
-            )
-        with col_m2:
-            st.metric(
-                label="Farmgate Price MAPE", 
-                value=farm_mape_str,
-                help="MAPE is calculated by backtesting the Farmgate Price model on the last 4 known historical quarters."
-            )
-        with col_m3:
-            st.metric(
-                label="Millgate Price MAPE", 
-                value=mill_mape_str,
-                help="MAPE is calculated by backtesting the Millgate Price model on the last 4 known historical quarters."
-            )
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("**Combined Forecasted Data Table (Production and Prices)**")
+        st.markdown("**Forecasted Production Data Table**")
         df_table = df_combined_forecast[df_combined_forecast['Type'] == 'Forecast'].copy()
         df_table.index.name = 'Forecast Period'
         df_table['Year'] = df_table.index.year
         df_table['Quarter'] = df_table.index.quarter.map({1: 'Q1', 2: 'Q2', 3: 'Q3', 4: 'Q4'})
-        df_table = df_table[['Year', 'Quarter', 'Copra_Production (MT)', 'Farmgate Price (PHP/kg)', 'Millgate Price (PHP/kg)']]
-        
-        # Round the final production values for display
         df_table['Copra_Production (MT)'] = df_table['Copra_Production (MT)'].round(2)
         
         # Final table display
         st.dataframe(
-            df_table,
+            df_table[['Year', 'Quarter', 'Copra_Production (MT)']],
             height=300
         )
 
         # --- D3. Model Diagnostics (Optional) ---
-        with st.expander("View ARIMA Model Summary (Production)"):
+        with st.expander("View ARIMA Model Summary"):
             st.code(model_summary)
             st.caption("Note: The model is a simple ARIMA(1, 1, 0) for demonstration purposes. Results may vary.")
 
     else:
-        st.error(f"ARIMA Model Error: {model_summary if isinstance(model_summary, str) else 'Could not generate model summary.'}")
+        st.error(model_summary)
         st.warning("Please ensure your dataset contains enough clean data points for the selected barangay to run the ARIMA model.")
 
     st.markdown("---")
 
-def comparison_page(df_original):
-    """Displays comparative visualizations for all barangays."""
+def comparison_page():
+    """Displays comparative visualizations for all barangays, using session state data."""
     
     st.title(":chart_with_upwards_trend: All Barangays Comparison")
     st.markdown("---")
+    
+    df_current = st.session_state['df_data']
+
     st.header("1. Production Comparison (Metric Tons)")
     
     # Group and pivot data for plotting all series
-    df_pivot_prod = df_original.pivot_table(
+    df_pivot_prod = df_current.pivot_table(
         index='Period', 
         columns='Barangay', 
         values='Copra_Production (MT)'
@@ -851,7 +752,7 @@ def comparison_page(df_original):
     
     # Plot Farmgate Price Comparison
     with col1:
-        df_pivot_farm = df_original.pivot_table(
+        df_pivot_farm = df_current.pivot_table(
             index='Period', 
             columns='Barangay', 
             values='Farmgate Price (PHP/kg)'
@@ -868,7 +769,7 @@ def comparison_page(df_original):
 
     # Plot Millgate Price Comparison
     with col2:
-        df_pivot_mill = df_original.pivot_table(
+        df_pivot_mill = df_current.pivot_table(
             index='Period', 
             columns='Barangay', 
             values='Millgate Price (PHP/kg)'
@@ -887,16 +788,13 @@ def comparison_page(df_original):
 # --- 4. Main App Navigation ---
 
 def run_app():
-    """Main function to run the Streamlit app with navigation and session state initialization."""
+    """Main function to run the Streamlit app with navigation."""
     
     # Setup Streamlit page configuration
     st.set_page_config(layout="wide", page_title="Copra Production & Price Dashboard")
     
-    # Initialize or load the master data into session state
-    if 'df_master' not in st.session_state:
-        st.session_state.df_master = load_initial_data()
-    
-    df_current = st.session_state.df_master
+    # Initialize data into session state
+    initialize_session_data()
     
     # Sidebar Navigation
     st.sidebar.title("Navigation")
@@ -907,9 +805,9 @@ def run_app():
     
     # Display the selected page
     if page == "Barangay Forecast & Analysis":
-        main_page(df_current)
+        main_page()
     elif page == "All Barangays Comparison":
-        comparison_page(df_current)
+        comparison_page()
 
 if __name__ == "__main__":
     run_app()
