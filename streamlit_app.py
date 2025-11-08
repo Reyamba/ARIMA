@@ -409,18 +409,25 @@ def load_data():
 
     # Convert 'Period' to datetime objects and set as index
     df['Period'] = pd.to_datetime(df['Period'])
+    df['Year'] = df['Period'].dt.year
+    df['Quarter'] = 'Q' + df['Period'].dt.quarter.astype(str)
     
     # Handle any potential missing values by filling with the mean of the column
-    df.fillna(df.mean(numeric_only=True), inplace=True)
+    # We do this before using the data in case of dynamic row additions.
+    df.fillna(df.mean(numeric_only=True), inplace=True) 
     
     return df
 
-# Load the data once
-df_original = load_data()
+def initialize_session_data():
+    """Initializes the data into Streamlit session state if not already present."""
+    if 'df_data' not in st.session_state:
+        st.session_state['df_data'] = load_data()
 
 
 # --- 2. ARIMA Forecasting Function (Updated for MAPE) ---
 
+# Note: st.cache_data relies on function arguments. We avoid passing the entire DataFrame
+# to let the caching work effectively with the selected series.
 @st.cache_data
 def arima_forecast(data_series, forecast_end_year):
     """
@@ -435,7 +442,7 @@ def arima_forecast(data_series, forecast_end_year):
         tuple: (pd.DataFrame, str, str) -> (Combined Data, Model Summary, MAPE String)
     """
     if data_series.empty or len(data_series) < 5:
-        return None, "Error: Insufficient data to perform forecasting.", "N/A"
+        return None, "Error: Insufficient data to perform forecasting (need at least 5 quarters).", "N/A"
         
     # 1. Backtest Split for MAPE Calculation (using last 4 quarters for testing)
     n_test = 4
@@ -448,6 +455,7 @@ def arima_forecast(data_series, forecast_end_year):
             test_data = data_series[-n_test:]
 
             # Temporarily fit model on training data for evaluation
+            # Using freq='QS-JAN' assumes quarterly data starting in Jan (Q1, Q2, Q3, Q4)
             model_train = ARIMA(train_data, order=(1, 1, 0), freq='QS-JAN')
             model_fit_train = model_train.fit()
             
@@ -498,22 +506,19 @@ def arima_forecast(data_series, forecast_end_year):
 
 # --- 3. Page Functions ---
 
-def main_page(df_original):
+def main_page():
     """Displays the single-barangay data editor, visualization, and ARIMA forecast."""
     
     st.title(":coconut: Barangay Production Analysis & Forecasting")
     st.markdown("---")
-
-    # Sidebar for Filtering - Done outside to control the main app loop
+    
+    # Use data from session state
+    df_current = st.session_state['df_data']
     
     # Get unique barangays for selection
-    barangays = df_original['Barangay'].unique()
+    barangays = df_current['Barangay'].unique()
     
-    # Use session state to manage selected barangay across pages (if needed), 
-    # but for simplicity, we use the sidebar selectbox, which is fine for the single-page experience.
-    if 'selected_barangay' not in st.session_state:
-        st.session_state.selected_barangay = barangays[0]
-
+    # Sidebar for Filtering
     st.sidebar.header("Barangay Selection")
     selected_barangay = st.sidebar.selectbox(
         "Select Barangay for Analysis:",
@@ -523,33 +528,92 @@ def main_page(df_original):
     
     # --- A. Data Viewer and Editor ---
     st.header(f"1. Raw Data Viewer & Editor for {selected_barangay}")
-    st.info("You can directly edit the data below. The model will use the latest values displayed here for forecasting.")
+    st.info("You can directly edit the values below or use the 'Add New Data Point' section to append a row.")
 
-    # Filter data for the selected barangay
-    df_barangay = df_original[df_original['Barangay'] == selected_barangay].reset_index(drop=True)
-    df_barangay_editable = df_barangay.sort_values(by='Period', ascending=True).copy()
+    # Filter data for the selected barangay to display in the editor
+    df_barangay_editable = df_current[df_current['Barangay'] == selected_barangay].sort_values(by='Period', ascending=True).copy()
 
-    # Use st.data_editor for interactive editing
+    # Use st.data_editor for interactive editing/deleting of the filtered data
     edited_df = st.data_editor(
         df_barangay_editable,
         column_config={
             "Period": st.column_config.DatetimeColumn("Period", format="YYYY-MM-DD", disabled=True),
             "Barangay": st.column_config.TextColumn("Barangay", disabled=True),
         },
+        key='data_editor',
         hide_index=True,
         num_rows="dynamic"
     )
 
-    # Convert the edited DataFrame back to a time series for modeling and visualization
-    edited_df['Period'] = pd.to_datetime(edited_df['Period'])
-    edited_df = edited_df.set_index('Period').sort_index()
+    # Convert edited_df back to the main DataFrame
+    # Note: st.data_editor returns the current state of the displayed dataframe.
+    # We need to rebuild the main session state data using the edited section.
+    if edited_df.shape[0] != df_barangay_editable.shape[0] or not edited_df.equals(df_barangay_editable):
+        # 1. Remove old data for the selected barangay from the session state
+        df_other_barangays = df_current[df_current['Barangay'] != selected_barangay]
+        
+        # 2. Add the newly edited (or deleted/modified) data
+        st.session_state['df_data'] = pd.concat([df_other_barangays, edited_df], ignore_index=True)
+        # Rerun is usually needed only if the data structure changes, but we rerun later after adding data.
+        
+    # Filter the final, processed data for the current barangay
+    df_barangay_final = st.session_state['df_data'][st.session_state['df_data']['Barangay'] == selected_barangay].copy()
     
-    ts_production = edited_df['Copra_Production (MT)']
-    ts_farmgate = edited_df['Farmgate Price (PHP/kg)']
-    ts_millgate = edited_df['Millgate Price (PHP/kg)']
+    # Convert the final DataFrame back to a time series for modeling and visualization
+    df_barangay_final['Period'] = pd.to_datetime(df_barangay_final['Period'])
+    df_barangay_final = df_barangay_final.set_index('Period').sort_index()
+    
+    ts_production = df_barangay_final['Copra_Production (MT)']
+    ts_farmgate = df_barangay_final['Farmgate Price (PHP/kg)']
+    ts_millgate = df_barangay_final['Millgate Price (PHP/kg)']
     last_historical_date = ts_production.index.max()
 
-    # --- B. Trend Analysis & Visualization (Production + Prices) ---
+    # --- B. Add New Data Point Form ---
+    st.header(f"1.5. Add New Data Point")
+    with st.expander("Click here to add a new data row"):
+        with st.form("add_data_form", clear_on_submit=True):
+            
+            # Use columns for a neat layout
+            col_b, col_p, col_c, col_f, col_m = st.columns(5)
+            
+            # Default the barangay to the currently selected one
+            current_barangay_index = list(barangays).index(selected_barangay)
+            
+            new_barangay = col_b.selectbox("Barangay", options=barangays, index=current_barangay_index)
+            # Suggest the next period's date
+            suggested_date = last_historical_date + DateOffset(months=3) if not ts_production.empty else None
+            new_period = col_p.date_input("Period (Q1=Jan, Q2=Apr, Q3=Jul, Q4=Oct)", value=suggested_date)
+
+            new_copra = col_c.number_input("Copra Production (MT)", min_value=0.0, format="%.2f")
+            new_farmgate = col_f.number_input("Farmgate Price (PHP/kg)", min_value=0.0, format="%.2f")
+            new_millgate = col_m.number_input("Millgate Price (PHP/kg)", min_value=0.0, format="%.2f")
+
+            submitted = st.form_submit_button("Add Data Point and Rerun Analysis")
+
+            if submitted:
+                if new_period is None:
+                    st.error("Please select a Period.")
+                else:
+                    new_period_dt = pd.to_datetime(new_period)
+                    new_data = {
+                        'Barangay': new_barangay,
+                        'Year': new_period_dt.year,
+                        'Quarter': f'Q{(new_period_dt.month - 1) // 3 + 1}',
+                        'Period': new_period_dt,
+                        'Copra_Production (MT)': new_copra,
+                        'Farmgate Price (PHP/kg)': new_farmgate,
+                        'Millgate Price (PHP/kg)': new_millgate
+                    }
+                    
+                    # Create a temporary DataFrame for the new row
+                    new_row_df = pd.DataFrame([new_data])
+
+                    # Append to session state
+                    st.session_state['df_data'] = pd.concat([st.session_state['df_data'], new_row_df], ignore_index=True)
+                    st.success(f"New data point added for **{new_barangay}** on **{new_period_dt.strftime('%Y-%m-%d')}**. Rerunning app...")
+                    st.rerun() # Rerun to update plots and forecasts
+
+    # --- C. Trend Analysis & Visualization (Production + Prices) ---
     st.header("2. Historical Trends (Production & Prices)")
     st.subheader(f"Historical Data for {selected_barangay}")
 
@@ -581,16 +645,17 @@ def main_page(df_original):
         ax_price.legend(loc='upper left')
         st.pyplot(fig_price)
 
-    # --- C. Forecasting ---
+    # --- D. Forecasting ---
     st.header("3. ARIMA Forecasting (2026 - 2035)")
     st.caption(f"Forecasting Copra Production (MT) starting from Q1 of the next period after {last_historical_date.strftime('%Y-%m-%d')}.")
 
     # Perform the forecast
-    df_combined_forecast, model_summary, mape_str = arima_forecast(ts_production, 2035)
+    # We use ts_production.copy() to ensure the series is hashable for st.cache_data
+    df_combined_forecast, model_summary, mape_str = arima_forecast(ts_production.copy(), 2035)
 
     if df_combined_forecast is not None:
         
-        # --- C1. Forecast Visualization ---
+        # --- D1. Forecast Visualization ---
         st.subheader("Forecast Visualization (Historical + Predicted)")
         
         # Line plot with forecast
@@ -618,7 +683,7 @@ def main_page(df_original):
         st.pyplot(fig_forecast)
         
 
-        # --- C2. Forecast Metrics & Table ---
+        # --- D2. Forecast Metrics & Table ---
         st.subheader("Forecast Metrics & Data")
         
         st.metric(
@@ -640,7 +705,7 @@ def main_page(df_original):
             height=300
         )
 
-        # --- C3. Model Diagnostics (Optional) ---
+        # --- D3. Model Diagnostics (Optional) ---
         with st.expander("View ARIMA Model Summary"):
             st.code(model_summary)
             st.caption("Note: The model is a simple ARIMA(1, 1, 0) for demonstration purposes. Results may vary.")
@@ -651,15 +716,18 @@ def main_page(df_original):
 
     st.markdown("---")
 
-def comparison_page(df_original):
-    """Displays comparative visualizations for all barangays."""
+def comparison_page():
+    """Displays comparative visualizations for all barangays, using session state data."""
     
     st.title(":chart_with_upwards_trend: All Barangays Comparison")
     st.markdown("---")
+    
+    df_current = st.session_state['df_data']
+
     st.header("1. Production Comparison (Metric Tons)")
     
     # Group and pivot data for plotting all series
-    df_pivot_prod = df_original.pivot_table(
+    df_pivot_prod = df_current.pivot_table(
         index='Period', 
         columns='Barangay', 
         values='Copra_Production (MT)'
@@ -684,7 +752,7 @@ def comparison_page(df_original):
     
     # Plot Farmgate Price Comparison
     with col1:
-        df_pivot_farm = df_original.pivot_table(
+        df_pivot_farm = df_current.pivot_table(
             index='Period', 
             columns='Barangay', 
             values='Farmgate Price (PHP/kg)'
@@ -701,7 +769,7 @@ def comparison_page(df_original):
 
     # Plot Millgate Price Comparison
     with col2:
-        df_pivot_mill = df_original.pivot_table(
+        df_pivot_mill = df_current.pivot_table(
             index='Period', 
             columns='Barangay', 
             values='Millgate Price (PHP/kg)'
@@ -725,8 +793,8 @@ def run_app():
     # Setup Streamlit page configuration
     st.set_page_config(layout="wide", page_title="Copra Production & Price Dashboard")
     
-    # Load data
-    df = load_data()
+    # Initialize data into session state
+    initialize_session_data()
     
     # Sidebar Navigation
     st.sidebar.title("Navigation")
@@ -737,9 +805,9 @@ def run_app():
     
     # Display the selected page
     if page == "Barangay Forecast & Analysis":
-        main_page(df)
+        main_page()
     elif page == "All Barangays Comparison":
-        comparison_page(df)
+        comparison_page()
 
 if __name__ == "__main__":
     run_app()
