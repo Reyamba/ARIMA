@@ -617,6 +617,9 @@ def main_page():
     st.header("2. Historical Trends (Production & Prices)")
     st.subheader(f"Historical Data for {selected_barangay}")
 
+    # Calculate Price Spread (Millgate - Farmgate)
+    ts_price_spread = ts_millgate - ts_farmgate
+
     col1, col2 = st.columns(2)
 
     with col1:
@@ -644,6 +647,31 @@ def main_page():
         ax_price.grid(axis='y', linestyle='--')
         ax_price.legend(loc='upper left')
         st.pyplot(fig_price)
+    
+    # --- C.3 Price Spread Visualization (New Addition) ---
+    st.subheader("2.5. Price Spread Analysis (Millgate Price - Farmgate Price)")
+    st.caption("The price spread represents the margin captured by intermediary layers in the supply chain.")
+    
+    # Price Spread Line Plot
+    fig_spread, ax_spread = plt.subplots(figsize=(12, 6))
+    ts_price_spread.plot(
+        ax=ax_spread, 
+        marker='D', # Diamond marker
+        linestyle='-', 
+        color='#7E30E1', 
+        label='Price Spread (PHP/kg)'
+    )
+    
+    # Add a horizontal line for the average spread
+    mean_spread = ts_price_spread.mean()
+    ax_spread.axhline(mean_spread, color='red', linestyle='--', linewidth=1, label=f'Average Spread: {mean_spread:.2f} PHP/kg')
+    
+    ax_spread.set_title(f'Millgate vs. Farmgate Price Spread Trend for {selected_barangay}')
+    ax_spread.set_xlabel('Time (Quarterly)')
+    ax_spread.set_ylabel('Price Spread (PHP/kg)')
+    ax_spread.grid(axis='y', linestyle=':')
+    ax_spread.legend(loc='upper left')
+    st.pyplot(fig_spread)
 
     # --- D. Forecasting ---
     st.header("3. ARIMA Forecasting (2026 - 2035)")
