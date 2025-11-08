@@ -3,3 +3,4 @@ pandas
 matplotlib
 statsmodels
 numpy
+mean_absolute_percentage_error
