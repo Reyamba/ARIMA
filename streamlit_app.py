@@ -1,4 +1,4 @@
-"import streamlit as st
+import streamlit as st
 import pandas as pd
 import io
 import matplotlib.pyplot as plt
@@ -623,4 +623,4 @@ else:
     st.warning("Please ensure your dataset contains enough clean data points for the selected barangay to run the ARIMA model.")
 
 st.markdown("---")
-st.sidebar.markdown("Built with Streamlit & `statsmodels`")"
+st.sidebar.markdown("Built with Streamlit & `statsmodels`")
