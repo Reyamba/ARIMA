@@ -5,14 +5,14 @@ import matplotlib.pyplot as plt
 from statsmodels.tsa.arima.model import ARIMA
 from pandas.tseries.offsets import DateOffset
 import warnings
+from sklearn.metrics import mean_absolute_percentage_error as calculate_mape
+
+# Suppress warnings from statsmodels, which are common in Streamlit environments
+warnings.filterwarnings("ignore")
 
 # --- 1. Data Loading and Initial Preprocessing ---
-# Load the data from the provided CSV file content
-# This ensures the app is fully self-contained and runnable
-def load_data():
-    """Loads and preprocesses the Copra Production data."""
-    # Data snippet provided by the user from the uploaded file
-    csv_content = """Barangay,Year,Quarter,Period,Copra_Production (MT),Farmgate Price (PHP/kg),Millgate Price (PHP/kg)
+# Data snippet provided by the user from the uploaded file
+CSV_CONTENT = """Barangay,Year,Quarter,Period,Copra_Production (MT),Farmgate Price (PHP/kg),Millgate Price (PHP/kg)
 Poblacion,2015,Q1,2015-01-01,32.17,24.50,28.50
 Poblacion,2015,Q2,2015-04-01,32.15,23.00,27.00
 Poblacion,2015,Q3,2015-07-01,32.18,21.00,25.00
@@ -400,57 +400,77 @@ Nueva Era,2024,Q4,2024-10-01,12.00,40.00,50.00
 Nueva Era,2025,Q1,2025-01-01,12.37,48.64,52.12
 Nueva Era,2025,Q2,2025-04-01,12.40,64.55,81.00
 Nueva Era,2025,Q3,2025-07-01,12.50,56.79,72.70
-
 """
-    
-    df = pd.read_csv(io.StringIO(csv_content))
-    
+
+@st.cache_data
+def load_data():
+    """Loads and preprocesses the Copra Production data."""
+    df = pd.read_csv(io.StringIO(CSV_CONTENT))
+
     # Convert 'Period' to datetime objects and set as index
     df['Period'] = pd.to_datetime(df['Period'])
     
     # Handle any potential missing values by filling with the mean of the column
-    # NOTE: Filling with mean is a simple approach. More complex imputation methods 
-    # might be needed for production.
-    df.fillna(df.mean(numeric_only=True), inplace=True) 
+    df.fillna(df.mean(numeric_only=True), inplace=True)
     
     return df
 
+# Load the data once
 df_original = load_data()
 
-# --- 2. ARIMA Forecasting Function ---
+
+# --- 2. ARIMA Forecasting Function (Updated for MAPE) ---
 
 @st.cache_data
 def arima_forecast(data_series, forecast_end_year):
     """
-    Fits an ARIMA model and forecasts the series up to the specified year.
+    Fits an ARIMA model, calculates MAPE on the last 4 historical points,
+    and forecasts the series up to the specified year.
     
     Args:
         data_series (pd.Series): The time series data (Copra Production).
         forecast_end_year (int): The last year to forecast to (e.g., 2035).
         
     Returns:
-        pd.DataFrame: DataFrame containing historical and forecasted data.
-        str: Model summary or error message.
+        tuple: (pd.DataFrame, str, str) -> (Combined Data, Model Summary, MAPE String)
     """
     if data_series.empty or len(data_series) < 5:
-        return None, "Error: Insufficient data to perform forecasting."
+        return None, "Error: Insufficient data to perform forecasting.", "N/A"
         
-    # Standard practice: Use ARIMA(1, 1, 0) as a robust, simple model for demonstration
+    # 1. Backtest Split for MAPE Calculation (using last 4 quarters for testing)
+    n_test = 4
+    mape_str = "N/A (Not enough data points for validation)"
+    
     try:
-        # ARIMA model constructor will try to infer frequency from the index. 
-        # We explicitly set freq='QS-JAN' to ensure quarterly start dates are used.
-        model = ARIMA(data_series, order=(1, 1, 0), freq='QS-JAN')
-        model_fit = model.fit()
+        # Check if there is enough data to split for a meaningful MAPE calculation
+        if len(data_series) > n_test:
+            train_data = data_series[:-n_test]
+            test_data = data_series[-n_test:]
+
+            # Temporarily fit model on training data for evaluation
+            model_train = ARIMA(train_data, order=(1, 1, 0), freq='QS-JAN')
+            model_fit_train = model_train.fit()
+            
+            # Predict the test period
+            test_forecast = model_fit_train.get_forecast(steps=n_test)
+            test_pred = test_forecast.predicted_mean
+            
+            # Calculate MAPE
+            mape_value = calculate_mape(test_data.values, test_pred.values) * 100
+            mape_str = f"{mape_value:.2f}% (on last 4 quarters)"
+            
+        # 2. Main Forecast: Fit model on ALL available historical data
+        model_full = ARIMA(data_series, order=(1, 1, 0), freq='QS-JAN')
+        model_fit_full = model_full.fit()
         
-        # Determine the start date for forecasting (the period after the last known data point)
-        # Using DateOffset(months=3) correctly moves to the next quarter start
+        # Determine the start date for forecasting
         start_date = data_series.index[-1] + DateOffset(months=3)
         
         # Create the future date range (Quarterly Start frequency)
         future_dates = pd.date_range(start=start_date, end=f'{forecast_end_year}-10-01', freq='QS')
         
         # Generate the forecast
-        forecast = model_fit.get_forecast(steps=len(future_dates))
+        forecast = model_fit_full.get_forecast(steps=len(future_dates))
         forecast_values = forecast.predicted_mean
         
         # Create a DataFrame for the forecast results
@@ -470,157 +490,256 @@ def arima_forecast(data_series, forecast_end_year):
         # Combine historical and forecasted data
         df_combined = pd.concat([df_historical, df_forecast])
         
-        return df_combined, model_fit.summary()
+        return df_combined, model_fit_full.summary(), mape_str
         
     except Exception as e:
-        return None, f"ARIMA Model Error: {e}"
+        return None, f"ARIMA Model Error: {e}", "N/A"
 
-# --- 3. Streamlit UI and Logic ---
 
-st.set_page_config(layout="wide", page_title="Copra Production & Price Dashboard")
+# --- 3. Page Functions ---
 
-st.title(":coconut: Copra Production Trend Analysis & Forecasting")
-st.markdown("---")
-
-# --- Sidebar for Filtering ---
-st.sidebar.header("Filter & Model Options")
-
-# Get unique barangays for selection
-barangays = df_original['Barangay'].unique()
-selected_barangay = st.sidebar.selectbox(
-    "Select Barangay for Analysis:",
-    options=barangays
-)
-
-# --- Main Dashboard Sections ---
-
-# --- A. Data Viewer and Editor ---
-st.header("1. Raw Data Viewer & Editor")
-st.info("You can directly edit the data below. The model will use the latest values displayed here for forecasting.")
-
-# Filter data for the selected barangay
-df_barangay = df_original[df_original['Barangay'] == selected_barangay].reset_index(drop=True)
-df_barangay_editable = df_barangay.sort_values(by='Period', ascending=True).copy()
-
-# Use st.data_editor for interactive editing
-edited_df = st.data_editor(
-    df_barangay_editable,
-    column_config={
-        "Period": st.column_config.DatetimeColumn("Period", format="YYYY-MM-DD", disabled=True),
-        "Barangay": st.column_config.TextColumn("Barangay", disabled=True),
-    },
-    hide_index=True,
-    num_rows="dynamic"
-)
-
-# Convert the edited DataFrame back to a time series for modeling
-edited_df['Period'] = pd.to_datetime(edited_df['Period'])
-# FIX: Removed freq='QS-JAN' from sort_index() to avoid TypeError 
-# when the index frequency is lost by st.data_editor interaction.
-ts_data = edited_df.set_index('Period')['Copra_Production (MT)'].sort_index()
-last_historical_date = ts_data.index.max()
-
-# --- B. Trend Analysis & Visualization ---
-st.header(f"2. Historical Trends for {selected_barangay}")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("Line Plot (Production over Time)")
-    # Create line plot
-    fig_line, ax_line = plt.subplots(figsize=(10, 5))
-    ts_data.plot(ax=ax_line, marker='o', linestyle='-', color='#0077B6')
-    ax_line.set_title(f'Copra Production (MT) over Time in {selected_barangay}')
-    ax_line.set_xlabel('Time (Quarterly)')
-    ax_line.set_ylabel('Copra Production (MT)')
-    ax_line.grid(axis='y', linestyle='--')
-    st.pyplot(fig_line)
+def main_page(df_original):
+    """Displays the single-barangay data editor, visualization, and ARIMA forecast."""
     
+    st.title(":coconut: Barangay Production Analysis & Forecasting")
+    st.markdown("---")
 
-with col2:
-    st.subheader("Bar Chart (Production Volume)")
-    # Create bar chart
-    fig_bar, ax_bar = plt.subplots(figsize=(10, 5))
-    ts_data.plot(kind='bar', ax=ax_bar, color='#48A9A6')
+    # Sidebar for Filtering - Done outside to control the main app loop
     
-    # Show only year labels on X-axis for readability
-    n_ticks = len(ts_data)
-    if n_ticks > 0:
-        # Determine skip count dynamically
-        skip_count = max(1, n_ticks // 8) # Show max 8 ticks
-        # Map the date index to year strings, skipping labels for cleaner look
-        tick_labels = [label.strftime('%Y') if i % skip_count == 0 else '' for i, label in enumerate(ts_data.index)]
-        ax_bar.set_xticklabels(tick_labels, rotation=45, ha='right')
+    # Get unique barangays for selection
+    barangays = df_original['Barangay'].unique()
+    
+    # Use session state to manage selected barangay across pages (if needed), 
+    # but for simplicity, we use the sidebar selectbox, which is fine for the single-page experience.
+    if 'selected_barangay' not in st.session_state:
+        st.session_state.selected_barangay = barangays[0]
+
+    st.sidebar.header("Barangay Selection")
+    selected_barangay = st.sidebar.selectbox(
+        "Select Barangay for Analysis:",
+        options=barangays,
+        key='barangay_select'
+    )
+    
+    # --- A. Data Viewer and Editor ---
+    st.header(f"1. Raw Data Viewer & Editor for {selected_barangay}")
+    st.info("You can directly edit the data below. The model will use the latest values displayed here for forecasting.")
+
+    # Filter data for the selected barangay
+    df_barangay = df_original[df_original['Barangay'] == selected_barangay].reset_index(drop=True)
+    df_barangay_editable = df_barangay.sort_values(by='Period', ascending=True).copy()
+
+    # Use st.data_editor for interactive editing
+    edited_df = st.data_editor(
+        df_barangay_editable,
+        column_config={
+            "Period": st.column_config.DatetimeColumn("Period", format="YYYY-MM-DD", disabled=True),
+            "Barangay": st.column_config.TextColumn("Barangay", disabled=True),
+        },
+        hide_index=True,
+        num_rows="dynamic"
+    )
+
+    # Convert the edited DataFrame back to a time series for modeling and visualization
+    edited_df['Period'] = pd.to_datetime(edited_df['Period'])
+    edited_df = edited_df.set_index('Period').sort_index()
+    
+    ts_production = edited_df['Copra_Production (MT)']
+    ts_farmgate = edited_df['Farmgate Price (PHP/kg)']
+    ts_millgate = edited_df['Millgate Price (PHP/kg)']
+    last_historical_date = ts_production.index.max()
+
+    # --- B. Trend Analysis & Visualization (Production + Prices) ---
+    st.header("2. Historical Trends (Production & Prices)")
+    st.subheader(f"Historical Data for {selected_barangay}")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.caption("Copra Production (Metric Tons)")
+        # Production Line Plot
+        fig_prod, ax_prod = plt.subplots(figsize=(10, 5))
+        ts_production.plot(ax=ax_prod, marker='o', linestyle='-', color='#0077B6', label='Production (MT)')
+        ax_prod.set_title(f'Copra Production Trend')
+        ax_prod.set_xlabel('Time (Quarterly)')
+        ax_prod.set_ylabel('Production (MT)')
+        ax_prod.grid(axis='y', linestyle='--')
+        ax_prod.legend(loc='upper left')
+        st.pyplot(fig_prod)
         
-    ax_bar.set_title(f'Quarterly Copra Production Volume in {selected_barangay}')
-    ax_bar.set_xlabel('Period')
-    ax_bar.set_ylabel('Copra Production (MT)')
-    st.pyplot(fig_bar)
-    
 
-# --- C. Forecasting ---
-st.header("3. ARIMA Forecasting (2026 - 2035)")
-st.caption(f"Forecasting Copra Production (MT) starting from Q1 of the next period after {last_historical_date.strftime('%Y-%m-%d')}.")
+    with col2:
+        st.caption("Farmgate and Millgate Prices (PHP/kg)")
+        # Price Line Plot
+        fig_price, ax_price = plt.subplots(figsize=(10, 5))
+        ts_farmgate.plot(ax=ax_price, marker='s', linestyle='-', color='#48A9A6', label='Farmgate Price')
+        ts_millgate.plot(ax=ax_price, marker='^', linestyle='-', color='#F4A261', label='Millgate Price')
+        ax_price.set_title(f'Copra Price Trends')
+        ax_price.set_xlabel('Time (Quarterly)')
+        ax_price.set_ylabel('Price (PHP/kg)')
+        ax_price.grid(axis='y', linestyle='--')
+        ax_price.legend(loc='upper left')
+        st.pyplot(fig_price)
 
-# Perform the forecast
-# Suppress the warnings from statsmodels that often appear with small datasets
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore")
-    df_combined_forecast, model_summary = arima_forecast(ts_data, 2035)
+    # --- C. Forecasting ---
+    st.header("3. ARIMA Forecasting (2026 - 2035)")
+    st.caption(f"Forecasting Copra Production (MT) starting from Q1 of the next period after {last_historical_date.strftime('%Y-%m-%d')}.")
 
-if df_combined_forecast is not None:
+    # Perform the forecast
+    df_combined_forecast, model_summary, mape_str = arima_forecast(ts_production, 2035)
+
+    if df_combined_forecast is not None:
+        
+        # --- C1. Forecast Visualization ---
+        st.subheader("Forecast Visualization (Historical + Predicted)")
+        
+        # Line plot with forecast
+        fig_forecast, ax_forecast = plt.subplots(figsize=(12, 6))
+        
+        # Plot Historical data
+        df_combined_forecast[df_combined_forecast['Type'] == 'Historical']['Copra_Production (MT)'].plot(
+            ax=ax_forecast, label='Historical Production', color='#1E88E5', linestyle='-'
+        )
+        
+        # Plot Forecast data
+        df_combined_forecast[df_combined_forecast['Type'] == 'Forecast']['Copra_Production (MT)'].plot(
+            ax=ax_forecast, label='ARIMA Forecast (2035)', color='#FF7043', linestyle='--'
+        )
+        
+        ax_forecast.set_title(f'Copra Production Forecast for {selected_barangay} (2015-2035)')
+        ax_forecast.set_xlabel('Period')
+        ax_forecast.set_ylabel('Copra Production (MT)')
+        ax_forecast.legend()
+        ax_forecast.grid(axis='y', linestyle=':')
+        
+        # Highlight the split point between history and forecast
+        ax_forecast.axvline(x=last_historical_date, color='grey', linestyle=':', linewidth=2, label='Forecast Start')
+        
+        st.pyplot(fig_forecast)
+        
+
+        # --- C2. Forecast Metrics & Table ---
+        st.subheader("Forecast Metrics & Data")
+        
+        st.metric(
+            label="ARIMA Model Mean Absolute Percentage Error (MAPE)", 
+            value=mape_str,
+            help="MAPE is calculated by backtesting the model on the last 4 known historical quarters to estimate predictive accuracy."
+        )
+
+        st.markdown("**Forecasted Production Data Table**")
+        df_table = df_combined_forecast[df_combined_forecast['Type'] == 'Forecast'].copy()
+        df_table.index.name = 'Forecast Period'
+        df_table['Year'] = df_table.index.year
+        df_table['Quarter'] = df_table.index.quarter.map({1: 'Q1', 2: 'Q2', 3: 'Q3', 4: 'Q4'})
+        df_table['Copra_Production (MT)'] = df_table['Copra_Production (MT)'].round(2)
+        
+        # Final table display
+        st.dataframe(
+            df_table[['Year', 'Quarter', 'Copra_Production (MT)']],
+            height=300
+        )
+
+        # --- C3. Model Diagnostics (Optional) ---
+        with st.expander("View ARIMA Model Summary"):
+            st.code(model_summary)
+            st.caption("Note: The model is a simple ARIMA(1, 1, 0) for demonstration purposes. Results may vary.")
+
+    else:
+        st.error(model_summary)
+        st.warning("Please ensure your dataset contains enough clean data points for the selected barangay to run the ARIMA model.")
+
+    st.markdown("---")
+
+def comparison_page(df_original):
+    """Displays comparative visualizations for all barangays."""
     
-    # --- C1. Forecast Visualization ---
-    st.subheader("Forecast Visualization (Historical + Predicted)")
+    st.title(":chart_with_upwards_trend: All Barangays Comparison")
+    st.markdown("---")
+    st.header("1. Production Comparison (Metric Tons)")
     
-    # Line plot with forecast
-    fig_forecast, ax_forecast = plt.subplots(figsize=(12, 6))
-    
-    # Plot Historical data
-    df_combined_forecast[df_combined_forecast['Type'] == 'Historical']['Copra_Production (MT)'].plot(
-        ax=ax_forecast, label='Historical Production', color='#1E88E5', linestyle='-'
+    # Group and pivot data for plotting all series
+    df_pivot_prod = df_original.pivot_table(
+        index='Period', 
+        columns='Barangay', 
+        values='Copra_Production (MT)'
     )
     
-    # Plot Forecast data
-    df_combined_forecast[df_combined_forecast['Type'] == 'Forecast']['Copra_Production (MT)'].plot(
-        ax=ax_forecast, label='ARIMA Forecast (2035)', color='#FF7043', linestyle='--'
+    # Plot Production Comparison
+    fig_prod, ax_prod = plt.subplots(figsize=(12, 6))
+    df_pivot_prod.plot(ax=ax_prod, marker='.', linestyle='-')
+    ax_prod.set_title('Copra Production (MT) Comparison Across All Barangays')
+    ax_prod.set_xlabel('Period')
+    ax_prod.set_ylabel('Copra Production (MT)')
+    ax_prod.legend(title='Barangay', bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax_prod.grid(axis='y', linestyle=':')
+    plt.tight_layout()
+    st.pyplot(fig_prod)
+    
+    st.markdown("---")
+    
+    st.header("2. Price Comparison (Farmgate & Millgate)")
+    
+    col1, col2 = st.columns(2)
+    
+    # Plot Farmgate Price Comparison
+    with col1:
+        df_pivot_farm = df_original.pivot_table(
+            index='Period', 
+            columns='Barangay', 
+            values='Farmgate Price (PHP/kg)'
+        )
+        fig_farm, ax_farm = plt.subplots(figsize=(10, 5))
+        df_pivot_farm.plot(ax=ax_farm, marker='.', linestyle='-')
+        ax_farm.set_title('Farmgate Price (PHP/kg) Comparison')
+        ax_farm.set_xlabel('Period')
+        ax_farm.set_ylabel('Price (PHP/kg)')
+        ax_farm.legend(title='Barangay', fontsize=8, loc='upper left')
+        ax_farm.grid(axis='y', linestyle=':')
+        plt.tight_layout()
+        st.pyplot(fig_farm)
+
+    # Plot Millgate Price Comparison
+    with col2:
+        df_pivot_mill = df_original.pivot_table(
+            index='Period', 
+            columns='Barangay', 
+            values='Millgate Price (PHP/kg)'
+        )
+        fig_mill, ax_mill = plt.subplots(figsize=(10, 5))
+        df_pivot_mill.plot(ax=ax_mill, marker='.', linestyle='-')
+        ax_mill.set_title('Millgate Price (PHP/kg) Comparison')
+        ax_mill.set_xlabel('Period')
+        ax_mill.set_ylabel('Price (PHP/kg)')
+        ax_mill.legend(title='Barangay', fontsize=8, loc='upper left')
+        ax_mill.grid(axis='y', linestyle=':')
+        plt.tight_layout()
+        st.pyplot(fig_mill)
+
+
+# --- 4. Main App Navigation ---
+
+def run_app():
+    """Main function to run the Streamlit app with navigation."""
+    
+    # Setup Streamlit page configuration
+    st.set_page_config(layout="wide", page_title="Copra Production & Price Dashboard")
+    
+    # Load data
+    df = load_data()
+    
+    # Sidebar Navigation
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio(
+        "Select a Page",
+        ("Barangay Forecast & Analysis", "All Barangays Comparison")
     )
     
-    ax_forecast.set_title(f'Copra Production Forecast for {selected_barangay} (2015-2035)')
-    ax_forecast.set_xlabel('Period')
-    ax_forecast.set_ylabel('Copra Production (MT)')
-    ax_forecast.legend()
-    ax_forecast.grid(axis='y', linestyle=':')
-    
-    # Highlight the split point between history and forecast
-    ax_forecast.axvline(x=last_historical_date, color='grey', linestyle=':', linewidth=2, label='Forecast Start')
-    
-    st.pyplot(fig_forecast)
-    
+    # Display the selected page
+    if page == "Barangay Forecast & Analysis":
+        main_page(df)
+    elif page == "All Barangays Comparison":
+        comparison_page(df)
 
-    # --- C2. Forecast Table ---
-    st.subheader("Forecasted Data Table")
-    
-    df_table = df_combined_forecast[df_combined_forecast['Type'] == 'Forecast'].copy()
-    df_table.index.name = 'Forecast Period'
-    df_table['Year'] = df_table.index.year
-    df_table['Quarter'] = df_table.index.quarter.map({1: 'Q1', 2: 'Q2', 3: 'Q3', 4: 'Q4'})
-    df_table['Copra_Production (MT)'] = df_table['Copra_Production (MT)'].round(2)
-    
-    # Final table display
-    st.dataframe(
-        df_table[['Year', 'Quarter', 'Copra_Production (MT)']],
-        height=300
-    )
-
-    # --- C3. Model Diagnostics (Optional) ---
-    with st.expander("View ARIMA Model Summary"):
-        st.code(model_summary)
-        st.caption("Note: The model is a simple ARIMA(1, 1, 0) for demonstration purposes. Results may vary.")
-
-else:
-    st.error(model_summary)
-    st.warning("Please ensure your dataset contains enough clean data points for the selected barangay to run the ARIMA model.")
-
-st.markdown("---")
-st.sidebar.markdown("Built with Streamlit & `statsmodels`")
+if __name__ == "__main__":
+    run_app()
