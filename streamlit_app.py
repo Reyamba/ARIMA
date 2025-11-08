@@ -457,7 +457,7 @@ def arima_forecast(data_series, forecast_end_year):
             
             # Calculate MAPE
             mape_value = calculate_mape(test_data.values, test_pred.values) * 100
-            mape_str = f"{mape_value:.2f}% (on last 4 quarters)"
+            mape_str = f"{mape_value:.2f}% "
             
         # 2. Main Forecast: Fit model on ALL available historical data
         model_full = ARIMA(data_series, order=(1, 1, 0), freq='QS-JAN')
